@@ -1,2 +1,5 @@
 .env
 *.csv
+*.jsonl
+audio/
+cookies.txt

@@ -3,11 +3,14 @@ Download the audio for every video in video_data.csv with yt-dlp, in parallel,
 into an `audio/` folder next to this script.
  
 Setup (Mac):
-    python3 -m pip install "yt-dlp[default]" pandas tqdm   # [default] includes yt-dlp-ejs
+    uv venv --python 3.12 .venv      # yt-dlp needs Python 3.11+; system python3 is 3.9
+    uv pip install --python .venv/bin/python -U "yt-dlp[default]" pandas tqdm   # [default] includes yt-dlp-ejs
     brew install deno ffmpeg      # Deno: needed for YouTube. ffmpeg: needed for CLIP_SECONDS
  
 Run:
-    python3 download_audio.py
+    .venv/bin/python audio.py
+
+If every video fails with "The page needs to be reloaded", update yt-dlp first (re-run the uv pip line).
  
 Output:
     audio/<first 2 chars of ID>/<video ID>.<ext>   the audio files (.webm Opus or .m4a)
@@ -34,20 +37,21 @@ from yt_dlp.utils import DownloadError, download_range_func
 # ----------------------------------------------------------------------------
 # Settings
 # ----------------------------------------------------------------------------
-INPUT = "video_data.csv"
+INPUT = "video_data1.csv"
 ID_COL = "Video ID"
 AUDIO_DIR = "audio"
 LOG_PATH = "audio_log.jsonl"
 INDEX_PATH = "audio_index.csv"
  
-MAX_WORKERS = 4            # parallel downloads; more = faster but blocked sooner
-SLEEP_RANGE = (2.0, 5.0)   # each worker waits this long (random) between videos
+MAX_WORKERS = 1            # one worker stays under the ~300 videos/hour limit without an account
+SLEEP_RANGE = (5.0, 10.0)  # wait between videos (random); yt-dlp recommends 5-10 s
 CLIP_SECONDS = None        # e.g. 60 = keep only the first 60 s (needs ffmpeg); None = full audio
 LOW_BITRATE = True         # smallest Opus stream (~50 kbps, fine for speech models)
 MIN_FREE_GB = 5            # stop before the disk fills up
-BLOCK_COOLDOWN = 300       # seconds every worker pauses when YouTube blocks us
+BLOCK_COOLDOWN = 3600      # seconds to pause when YouTube blocks us; these blocks last well over 30 min
 MAX_BLOCKS_IN_A_ROW = 5    # give up after this many blocks with no success between
 PROXY = None               # e.g. "http://user:pass@host:port" for a rotating proxy
+COOKIES_FILE = None        # e.g. "cookies.txt" exported from a throwaway account; never commit this file
  
 # yt-dlp error text -> our label. Permanent ones are never retried.
 PERMANENT_PATTERNS = {
@@ -90,6 +94,8 @@ def ydl_options():
     }
     if CLIP_SECONDS:
         opts["download_ranges"] = download_range_func(None, [(0, CLIP_SECONDS)])
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         opts["proxy"] = PROXY
     return opts
@@ -178,6 +184,13 @@ def is_done(rec):
     return rec.get("kind") == "permanent"
  
  
+def retry_priority(rec):
+    """0 = blocked last time, 1 = failed some other way, 2 = never tried."""
+    if rec is None:
+        return 2
+    return 0 if rec.get("kind") == "blocked" else 1
+
+
 def read_video_ids(path=INPUT):
     """Read only the ID column, in chunks, so the 2.8 GB file never sits in memory."""
     ids = []
@@ -191,6 +204,7 @@ def download_audio(video_ids, max_workers=MAX_WORKERS):
     os.makedirs(AUDIO_DIR, exist_ok=True)
     log = load_log()
     todo = [vid for vid in video_ids if vid not in log or not is_done(log[vid])]
+    todo.sort(key=lambda vid: retry_priority(log.get(vid)))  # stable: keeps CSV order within each group
     print(f"{len(video_ids):,} videos, {len(video_ids) - len(todo):,} already done, "
           f"{len(todo):,} to download")
     if not todo:
