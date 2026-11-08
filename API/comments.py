@@ -13,7 +13,7 @@ def fetch_comments(part, video_col="Video ID", out_col="Comment Texts",
     part[out_col] = part[out_col].astype(object)
  
     #start = int(part[out_col].isna().to_numpy().argmax())
-    start = 0
+    start = 41400
     todo = part.iloc[start:]
     print(f"Starting at row {todo.index[0]} ({len(todo)} videos to go)")
  

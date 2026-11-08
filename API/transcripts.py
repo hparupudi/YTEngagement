@@ -1,7 +1,7 @@
 """
-Fetch the original-language ("default") YouTube transcript for every video in
-video_data.csv and store it in new columns:
- 
+Fetch the original-language ("default") YouTube transcript for every video in a
+CSV file and add these columns:
+
     transcript               full transcript text (None if it couldn't be fetched)
     transcript_language      language code of that transcript, which doubles as
                              the video's spoken language
@@ -9,16 +9,31 @@ video_data.csv and store it in new columns:
                              False if it was uploaded manually
     transcript_error         why there's no transcript, e.g. "TranscriptsDisabled",
                              "VideoUnavailable", "RequestBlocked" (None on success)
- 
+
 No language list is needed: each video's available tracks are listed and the
 original-language one is picked automatically.
- 
+
+Accepts files from collect_videos.py, including splits of them. Video IDs come from
+a `video_id` or `Video ID` column, or from the `url` column if neither exists.
+
+Run:
+    .venv/bin/python transcripts.py video_data1.csv
+
+Output, named after the input file:
+    video_data1_with_transcripts.csv     the input columns plus the new ones
+    video_data1_transcript_cache.jsonl   every result so far
+
+Re-running the same command resumes from the cache. Each input file gets its own
+cache, so splits can run at the same time without writing to the same file.
+
 Requires:  pip install youtube-transcript-api pandas tqdm
 Uses the current (1.x) API of youtube-transcript-api.
 """
  
+import argparse
 import json
 import os
+import re
 import time
  
 import pandas as pd
@@ -47,6 +62,24 @@ PERMANENT_ERRORS = {
 }
  
  
+def add_video_ids(df):
+    """Return df without leftover index columns and with a `video_id` column."""
+    df = df.drop(columns=[c for c in df.columns if str(c).startswith("Unnamed:")])
+    if "video_id" in df.columns:
+        return df
+    if "Video ID" in df.columns:
+        return df.rename(columns={"Video ID": "video_id"})
+    if "url" not in df.columns:
+        raise SystemExit("The CSV needs a video_id, Video ID or url column.")
+    ids = df["url"].astype(str).str.extract(r"[?&]v=([\w-]{11})", expand=False)
+    if ids.isna().any():
+        raise SystemExit(f"Could not read a video ID from {ids.isna().sum()} URL(s), "
+                         f"e.g. {df.loc[ids.isna(), 'url'].iloc[0]}")
+    df = df.copy()
+    df.insert(0, "video_id", ids)
+    return df
+
+
 def pick_default_transcript(transcript_list):
     """
     Choose the transcript in the video's original spoken language.
@@ -112,7 +145,7 @@ def fetch_transcript(ytt_api, video_id, max_retries=3):
     return None, None, None, last_error
  
  
-def add_transcripts(df, id_col="Video ID", delay=1,
+def add_transcripts(df, id_col="video_id", delay=1,
                     cache_path="transcript_cache.jsonl", ytt_api=None, desc="Transcripts"):
     """
     Fetch the default transcript for every video in df[id_col] and return df
@@ -177,18 +210,25 @@ def add_transcripts(df, id_col="Video ID", delay=1,
  
  
 if __name__ == "__main__":
-    INPUT = "video_data1.csv"
-    OUTPUT = "video_data1_with_transcripts.csv"
+    parser = argparse.ArgumentParser(description="Add YouTube transcripts to a video CSV.")
+    parser.add_argument("input", help="CSV of videos, e.g. video_data1.csv")
+    parser.add_argument("--output", help="default: <input>_with_transcripts.csv")
+    parser.add_argument("--cache", help="default: <input>_transcript_cache.jsonl")
+    parser.add_argument("--delay", type=float, default=1, help="seconds to wait between videos")
+    parser.add_argument("--nrows", type=int, help="only process the first N rows, for testing")
+    args = parser.parse_args()
+
+    stem = os.path.splitext(args.input)[0]
+    output = args.output or f"{stem}_with_transcripts.csv"
+    cache = args.cache or f"{stem}_transcript_cache.jsonl"
     CHUNK_SIZE = 50_000
- 
-    # video_data.csv is ~2.8 GB, so process it in chunks instead of all at once.
-    # The cache file is shared across chunks, so nothing is fetched twice.
-    reader = pd.read_csv(INPUT, index_col=0, chunksize=CHUNK_SIZE)
+
+    # Process in chunks so large files never have to fit in memory all at once.
+    # The cache is shared across chunks, so nothing is fetched twice.
+    reader = pd.read_csv(args.input, chunksize=CHUNK_SIZE, nrows=args.nrows, low_memory=False)
     for i, chunk in enumerate(reader, 1):
-        chunk = add_transcripts(chunk, desc=f"Chunk {i}")
-        chunk.to_csv(OUTPUT, mode="w" if i == 1 else "a", header=(i == 1))
- 
-    # For a small sample instead:
-    # df = pd.read_csv(INPUT, index_col=0, nrows=50)
-    # df = add_transcripts(df)
-    # print(df["transcript_error"].value_counts(dropna=False))
+        chunk = add_transcripts(add_video_ids(chunk), delay=args.delay, cache_path=cache,
+                                desc=f"Chunk {i}")
+        chunk.to_csv(output, mode="w" if i == 1 else "a", header=(i == 1), index=False)
+        print(chunk["transcript_error"].value_counts(dropna=False).to_string())
+    print(f"Saved {output}")
