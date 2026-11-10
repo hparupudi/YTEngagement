@@ -49,6 +49,7 @@ import re
 import time
  
 import pandas as pd
+import requests
 from tqdm import tqdm
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -79,6 +80,16 @@ PERMANENT_ERRORS = {
  
 class Blocked(Exception):
     """YouTube refused the request because of this IP."""
+
+
+class ConnectionLost(Exception):
+    """Couldn't reach YouTube (or the proxy) even after retrying."""
+
+
+# Network problems on our side, not anything about the video. Saving these to the
+# cache would record a bogus result, so the run stops instead. ProxyError and
+# SSLError are subclasses of ConnectionError.
+CONNECTION_ERRORS = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
 
 
 def base_language(code):
@@ -165,9 +176,11 @@ def fetch_transcript(ytt_api, video_id, expected=None, max_retries=3):
     """
     Return (text, language_code, is_generated, error) for one video's default
     transcript. On success error is None; on failure text/language/is_generated
-    are None and error names what went wrong. Raises Blocked if YouTube blocks the IP.
+    are None and error names what went wrong. Raises Blocked if YouTube blocks the IP,
+    and ConnectionLost if the connection keeps failing after `max_retries` tries.
     """
     last_error = None
+    connection_failed = False
     for attempt in range(max_retries):
         try:
             transcript = pick_default_transcript(ytt_api.list(video_id), expected)
@@ -182,10 +195,19 @@ def fetch_transcript(ytt_api, video_id, expected=None, max_retries=3):
             # The library's own error types: TranscriptsDisabled, VideoUnavailable,
             # PoTokenRequired, YouTubeRequestFailed, etc. The class name is the reason.
             return None, None, None, type(e).__name__
-        except Exception as e:  # network hiccups and anything unexpected
+        except CONNECTION_ERRORS as e:  # retry briefly; stop the run if it persists
             last_error = f"{type(e).__name__}: {str(e).strip()[:200]}"
+            connection_failed = True
+            tqdm.write(f"[{video_id}] connection error (try {attempt + 1}/{max_retries}): "
+                       f"{last_error}")
+            time.sleep(5 * (attempt + 1))
+        except Exception as e:  # anything unexpected
+            last_error = f"{type(e).__name__}: {str(e).strip()[:200]}"
+            connection_failed = False
             tqdm.write(f"[{video_id}] unexpected error: {last_error}")
             time.sleep(5 * (attempt + 1))
+    if connection_failed:
+        raise ConnectionLost(last_error)
     return None, None, None, last_error
 
 
@@ -196,7 +218,7 @@ def add_transcripts(df, id_col="video_id", cache_path="transcript_cache.jsonl",
     Fetch the default transcript for every video in df[id_col] and return
     (df, stopped), where df has `transcript`, `transcript_language`,
     `transcript_is_generated` and `transcript_error` columns, and stopped is True
-    if the run ended early because YouTube kept blocking it.
+    if the run ended early because YouTube kept blocking it or the connection failed.
 
     Results are cached to `cache_path` as they come in, so re-running picks up where
     it left off. Videos that failed for a temporary reason are retried, and so are
@@ -245,6 +267,12 @@ def add_transcripts(df, id_col="video_id", cache_path="transcript_cache.jsonl",
                 try:
                     text, lang, is_gen, error = fetch_transcript(ytt_api, vid, expected.get(vid))
                     blocks = 0
+                    break
+                except ConnectionLost as e:
+                    # Not cached, so this video is fetched again on the next run.
+                    tqdm.write(f"[{vid}] connection failed, stopping: {e}. "
+                               "Progress is saved; check your internet/proxy and rerun.")
+                    stopped = True
                     break
                 except Blocked as e:
                     blocks += 1
@@ -335,7 +363,7 @@ if __name__ == "__main__":
         raise SystemExit(130)
 
     if stopped:
-        print(f"Stopped early because of repeated blocks. {output} has what's done so far; "
+        print(f"Stopped early (repeated blocks or a lost connection). {output} has what's done so far; "
               "run the same command later to continue.")
     else:
         print(f"Saved {output}")
